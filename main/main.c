@@ -6,7 +6,6 @@
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
-#include "esp_rom_uart.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_timer.h"
@@ -14,7 +13,6 @@
 #define SAMPLE_RATE     16000
 #define DMA_FRAME_MS    32
 #define SAMPLES_PER_CH  512
-#define UART_BAUD        921600
 #define DMA_BUF_LEN     (SAMPLES_PER_CH * 2)
 #define CHANNEL_COUNT   3
 
@@ -153,7 +151,7 @@ static void build_frame(uint8_t *frame, uint32_t fc, int64_t ts_us,
 
 void app_main(void)
 {
-    esp_rom_uart_set_clock_baudrate(0, UART_BAUD);
+    
     printf("# HELLO 3-mic INMP441 (binary protocol)\n");
     fflush(stdout);
 

@@ -17,16 +17,16 @@ from collections import deque
 # ====== 配置 ======
 SAMPLE_RATE = 16000       # Hz
 SPEED_OF_SOUND = 340.0    # m/s
-MIC_DISTANCE = 0.20       # 麦克风间距 (m)
+D = 0.10                  # 半间距: MIC1-MIC2 = 2D = 20cm, MIC3 在 (0, D) (m)
 SAMPLES_PER_CH = 512
 CONFIDENCE_THRESHOLD = 0.15            # 互相关峰值低于此值丢弃
 SMOOTH_WINDOW = 5                       # 滑动窗口中值滤波窗口
 
-# 麦克风位置 (L 形阵列)
-# MIC1 = 原点, MIC2 = X 轴, MIC3 = Y 轴
-MIC1 = np.array([0.0, 0.0])
-MIC2 = np.array([MIC_DISTANCE, 0.0])
-MIC3 = np.array([0.0, MIC_DISTANCE])
+# 麦克风位置 (平面坐标系原点为0点)
+# MIC1(-10,0)cm, MIC2(10,0)cm, MIC3(0,10)cm
+MIC1 = np.array([-D, 0.0])
+MIC2 = np.array([D, 0.0])
+MIC3 = np.array([0.0, D])
 # ==================
 
 
@@ -58,17 +58,22 @@ def gcc_phat(sig1, sig2, n_fft=1024):
     return lag, confidence
 
 
-def fang_solve(d12, d13, D):
+def fang_solve(d12, d13, d):
     """Fang 算法: 从两个 TDOA 距离差求解 2D 位置 (x,y)
-    MIC1=(0,0), MIC2=(D,0), MIC3=(0,D)
+    MIC1=(-d,0), MIC2=(d,0), MIC3=(0,d)
     d12 = r2 - r1,  d13 = r3 - r1"""
-    if abs(d12) > D * 1.05 or abs(d13) > D * 1.05:
+    d12_max = 2.0 * d      # MIC1-MIC2 距离 = 2d
+    d13_max = np.sqrt(2) * d  # MIC1-MIC3 距离 = d√2
+    if abs(d12) > d12_max * 1.05 or abs(d13) > d13_max * 1.05:
         return None
 
-    a = (D * D - d12 * d12) / (2.0 * D)
-    b = -d12 / D
-    c = (D * D - d13 * d13) / (2.0 * D)
-    e = -d13 / D
+    _2d = 2.0 * d
+    _4d = 4.0 * d
+
+    a = -(d12 * d12) / _4d
+    b = -d12 / _2d
+    c = (d12 * d12 - 2.0 * d13 * d13) / _4d
+    e = (d12 - 2.0 * d13) / _2d
 
     A = b * b + e * e - 1.0
     B = 2.0 * (a * b + c * e)
@@ -88,11 +93,11 @@ def fang_solve(d12, d13, D):
             continue
         x = a + b * r1
         y = c + e * r1
-        # 验证: sqrt(x²+y²) 应接近 r1
-        r1_est = np.sqrt(x * x + y * y)
+        # 验证: sqrt((x+d)²+y²) 应接近 r1
+        r1_est = np.sqrt((x + d) * (x + d) + y * y)
         if abs(r1_est - r1) > 0.5:
             continue
-        if abs(x) > D * 5 or abs(y) > D * 5:
+        if abs(x) > d * 10 or abs(y) > d * 10:
             continue
         candidates.append((x, y, r1))
 
@@ -179,8 +184,8 @@ def main():
         dt_13 = lag_13 / SAMPLE_RATE
         d13 = dt_13 * SPEED_OF_SOUND
 
-        theta_12 = np.degrees(np.arcsin(np.clip(d12 / MIC_DISTANCE, -1, 1)))
-        theta_13 = np.degrees(np.arcsin(np.clip(d13 / MIC_DISTANCE, -1, 1)))
+        theta_12 = np.degrees(np.arcsin(np.clip(d12 / (2.0 * D), -1, 1)))
+        theta_13 = np.degrees(np.arcsin(np.clip(d13 / (np.sqrt(2) * D), -1, 1)))
         angles_12.append(theta_12)
         angles_13.append(theta_13)
         confidences_12.append(conf_12)
@@ -190,7 +195,7 @@ def main():
             positions.append(None)
             continue
 
-        result = fang_solve(d12, d13, MIC_DISTANCE)
+        result = fang_solve(d12, d13, D)
         if result:
             x, y, r1 = result
             positions.append((x, y))
@@ -226,14 +231,14 @@ def main():
 
     # ====== 图表 ======
     fig, axes = plt.subplots(2, 3, figsize=(16, 10))
-    fig.suptitle(f"3-Mic TDOA 2D 定位  (麦克风间距={MIC_DISTANCE*100:.0f}cm, {len(frames)}帧)", fontsize=14)
+    fig.suptitle(f"3-Mic TDOA 2D 定位  (MIC1(-10,0) MIC2(10,0) MIC3(0,10)cm, {len(frames)}帧)", fontsize=14)
 
     # 1. 声源位置散点图
     ax = axes[0, 0]
     ax.set_title("声源位置 (俯视图)")
     ax.set_xlabel("X (m)")
     ax.set_ylabel("Y (m)")
-    ax.scatter([0, MIC_DISTANCE, 0], [0, 0, MIC_DISTANCE],
+    ax.scatter([-D, D, 0], [0, 0, D],
                c=["#00cc66", "#ff6633", "#3399ff"], marker="^", s=150, zorder=5,
                label="MIC1(green) MIC2(orange) MIC3(blue)")
     if n_valid > 0:
