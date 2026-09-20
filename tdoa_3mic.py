@@ -12,22 +12,35 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 import sys
 import os
 import glob
-from collections import deque
 
 # ====== 配置 ======
 SAMPLE_RATE = 16000       # Hz
 SPEED_OF_SOUND = 340.0    # m/s
-D = 0.10                  # 半间距: MIC1-MIC2 = 2D = 20cm, MIC3 在 (0, D) (m)
+D = 0.17                  # 麦克风间距 (m): MIC1-MIC2 = MIC1-MIC3 = 17cm
 SAMPLES_PER_CH = 512
 CONFIDENCE_THRESHOLD = 0.15            # 互相关峰值低于此值丢弃
-SMOOTH_WINDOW = 5                       # 滑动窗口中值滤波窗口
 
-# 麦克风位置 (平面坐标系原点为0点)
-# MIC1(-10,0)cm, MIC2(10,0)cm, MIC3(0,10)cm
-MIC1 = np.array([-D, 0.0])
-MIC2 = np.array([D, 0.0])
-MIC3 = np.array([0.0, D])
+# 麦克风位置 (平面坐标系: MIC1为原点)
+# MIC1(0,0)  MIC2(D,0)  MIC3(0,-D)  单位 m
+# L通道=MIC1(接GND)  R通道=MIC2(接3.3V)  C通道=MIC3
 # ==================
+
+
+def preprocess(signal):
+    """预处理: DC去除 + 汉宁窗 + 语音带通滤波 (300-3400Hz)
+    返回处理后的信号 (numpy array, float64)"""
+    s = np.array(signal, dtype=np.float64)
+    n = len(s)
+    # 1. 去直流
+    s = s - np.mean(s)
+    # 2. 汉宁窗
+    s = s * np.hanning(n)
+    # 3. 频域带通滤波 (保留 300-3400Hz 语音频段)
+    S = np.fft.rfft(s)
+    freqs = np.fft.rfftfreq(n, d=1.0 / SAMPLE_RATE)
+    mask = (freqs >= 300) & (freqs <= 3400)
+    S[~mask] = 0
+    return np.fft.irfft(S).real[:n]
 
 
 def gcc_phat(sig1, sig2, n_fft=1024):
@@ -58,23 +71,57 @@ def gcc_phat(sig1, sig2, n_fft=1024):
     return lag, confidence
 
 
+def theta_triangulate(theta12_deg, theta13_deg, d):
+    """theta 三角定位 (远场近似): MIC1=(0,0), MIC2=(d,0), MIC3=(0,-d)
+    theta12: MIC1-MIC2 基线到达角 (°)
+    theta13: MIC1-MIC3 基线到达角 (°)
+    返回 (x, y) 或 None"""
+    t12 = np.radians(theta12_deg)
+    t13 = np.radians(theta13_deg)
+
+    # 线1: 过 MIC1-MIC2 中点 (d/2, 0), 方向角 = 90° + theta12
+    #  单位方向 = (cos(90°+θ12), sin(90°+θ12)) = (-sin θ12, cos θ12)
+    dir1 = np.array([-np.sin(t12), np.cos(t12)])
+    p1 = np.array([d / 2, 0.0])
+
+    # 线2: 过 MIC1-MIC3 中点 (0, -d/2), 方向角 = theta13
+    #  sin(θ13) = d13/d, 方向从 +x 起算 = θ13
+    dir2 = np.array([np.cos(t13), np.sin(t13)])
+    p2 = np.array([0.0, -d / 2])
+
+    # 求解交点: p1 + s·dir1 = p2 + t·dir2
+    A = np.column_stack([dir1, -dir2])
+    b = p2 - p1
+
+    try:
+        st = np.linalg.solve(A, b)
+    except np.linalg.LinAlgError:
+        return None
+    s = st[0]
+
+    pos = p1 + s * dir1
+    if abs(pos[0]) > d * 20 or abs(pos[1]) > d * 20:
+        return None
+    return pos[0], pos[1]
+
+
 def fang_solve(d12, d13, d):
     """Fang 算法: 从两个 TDOA 距离差求解 2D 位置 (x,y)
-    MIC1=(-d,0), MIC2=(d,0), MIC3=(0,d)
+    MIC1=(0,0), MIC2=(d,0), MIC3=(0,-d)
     d12 = r2 - r1,  d13 = r3 - r1"""
-    d12_max = 2.0 * d      # MIC1-MIC2 距离 = 2d
-    d13_max = np.sqrt(2) * d  # MIC1-MIC3 距离 = d√2
+    d12_max = d      # MIC1-MIC2 距离 = d
+    d13_max = d      # MIC1-MIC3 距离 = d
     if abs(d12) > d12_max * 1.05 or abs(d13) > d13_max * 1.05:
         return None
 
-    _2d = 2.0 * d
-    _4d = 4.0 * d
+    # 由 r2²-r1² 和 r3²-r1² 消元得到 x,y 关于 r1 的线性关系
+    # x = a + b*r1,  y = c + e*r1
+    a = d / 2.0 - (d12 * d12) / (2.0 * d)
+    b = -d12 / d
+    c = (d13 * d13) / (2.0 * d) - d / 2.0
+    e = d13 / d
 
-    a = -(d12 * d12) / _4d
-    b = -d12 / _2d
-    c = (d12 * d12 - 2.0 * d13 * d13) / _4d
-    e = (d12 - 2.0 * d13) / _2d
-
+    # 代入约束 r1² = x² + y² 得关于 r1 的二次方程: A·r1² + B·r1 + C = 0
     A = b * b + e * e - 1.0
     B = 2.0 * (a * b + c * e)
     C = a * a + c * c
@@ -93,8 +140,8 @@ def fang_solve(d12, d13, d):
             continue
         x = a + b * r1
         y = c + e * r1
-        # 验证: sqrt((x+d)²+y²) 应接近 r1
-        r1_est = np.sqrt((x + d) * (x + d) + y * y)
+        # 验证: sqrt(x²+y²) 应接近 r1 (MIC1在原点)
+        r1_est = np.sqrt(x * x + y * y)
         if abs(r1_est - r1) > 0.5:
             continue
         if abs(x) > d * 10 or abs(y) > d * 10:
@@ -103,7 +150,7 @@ def fang_solve(d12, d13, d):
 
     if not candidates:
         return None
-    return min(candidates, key=lambda t: t[2])  # 取最近的解
+    return max(candidates, key=lambda t: t[2])  # 取远场解
 
 
 def load_csv(path):
@@ -167,82 +214,103 @@ def main():
         return
 
     # TDOA 逐帧计算
-    positions = []
+    positions = []          # Fang 算法结果
+    positions_theta = []    # theta 三角定位结果
     angles_12 = []
     angles_13 = []
     confidences_12 = []
     confidences_13 = []
 
     for fi, (L, R, C) in enumerate(frames):
+        # 预处理: DC去除 + 加窗 + 语音带通滤波
+        Lp = preprocess(L)
+        Rp = preprocess(R)
+        Cp = preprocess(C)
+
         # MIC1-MIC2 (X 轴基线)
-        lag_12, conf_12 = gcc_phat(L, R)
+        lag_12, conf_12 = gcc_phat(Lp, Rp)
         dt_12 = lag_12 / SAMPLE_RATE
         d12 = dt_12 * SPEED_OF_SOUND
 
         # MIC1-MIC3 (Y 轴基线)
-        lag_13, conf_13 = gcc_phat(L, C)
+        lag_13, conf_13 = gcc_phat(Lp, Cp)
         dt_13 = lag_13 / SAMPLE_RATE
         d13 = dt_13 * SPEED_OF_SOUND
 
-        theta_12 = np.degrees(np.arcsin(np.clip(d12 / (2.0 * D), -1, 1)))
-        theta_13 = np.degrees(np.arcsin(np.clip(d13 / (np.sqrt(2) * D), -1, 1)))
+        theta_12 = np.degrees(np.arcsin(np.clip(d12 / D, -1, 1)))
+        theta_13 = np.degrees(np.arcsin(np.clip(d13 / D, -1, 1)))
         angles_12.append(theta_12)
         angles_13.append(theta_13)
         confidences_12.append(conf_12)
         confidences_13.append(conf_13)
 
+        # ---- Fang 算法 ----
         if conf_12 < CONFIDENCE_THRESHOLD or conf_13 < CONFIDENCE_THRESHOLD:
             positions.append(None)
-            continue
-
-        result = fang_solve(d12, d13, D)
-        if result:
-            x, y, r1 = result
-            positions.append((x, y))
         else:
-            positions.append(None)
+            result = fang_solve(d12, d13, D)
+            if result:
+                x, y, r1 = result
+                positions.append((x, y))
+            else:
+                positions.append(None)
+
+        # ---- theta 三角定位 ----
+        result_t = theta_triangulate(theta_12, theta_13, D)
+        if result_t:
+            positions_theta.append(result_t)
+        else:
+            positions_theta.append(None)
 
         if fi % 5 == 0:
-            status = f"({x:.2f}, {y:.2f})m" if result else "(无解)"
+            f_status = f"({x:.2f}, {y:.2f})m" if (conf_12 >= CONFIDENCE_THRESHOLD and conf_13 >= CONFIDENCE_THRESHOLD and result_t is not None and result is not None) else "(无解)"
+            t_status = f"({result_t[0]:.2f}, {result_t[1]:.2f})m" if result_t else "(无解)"
             print(f"帧 {fi:4d}  lag12={lag_12:+7.3f}  lag13={lag_13:+7.3f}  "
-                  f"d12={d12:+7.3f}m  d13={d13:+7.3f}m  {status}")
+                  f"d12={d12:+7.3f}m  d13={d13:+7.3f}m  Fang{f_status}  Theta{t_status}")
 
     # 统计
     valid_pos = [p for p in positions if p is not None]
     n_valid = len(valid_pos)
-    print(f"\n===== 统计 ({n_valid}/{len(frames)} 帧有效, {len(frames) - n_valid} 帧丢弃) =====")
+    valid_pos_t = [p for p in positions_theta if p is not None]
+    n_valid_t = len(valid_pos_t)
+    print(f"\n===== Fang 统计 ({n_valid}/{len(frames)} 帧有效, {len(frames) - n_valid} 帧丢弃) =====")
     if n_valid > 0:
         xs = [p[0] for p in valid_pos]
         ys = [p[1] for p in valid_pos]
         dists = [np.sqrt(x * x + y * y) for x, y in valid_pos]
-        smoothed_x = deque(maxlen=SMOOTH_WINDOW)
-        smoothed_y = deque(maxlen=SMOOTH_WINDOW)
-        for x, y in valid_pos:
-            smoothed_x.append(x)
-            smoothed_y.append(y)
-        sx = np.median(smoothed_x) if smoothed_x else 0
-        sy = np.median(smoothed_y) if smoothed_y else 0
         print(f"X: 均值={np.mean(xs):.3f}m  中值={np.median(xs):.3f}m  范围=[{min(xs):.3f}, {max(xs):.3f}]m")
         print(f"Y: 均值={np.mean(ys):.3f}m  中值={np.median(ys):.3f}m  范围=[{min(ys):.3f}, {max(ys):.3f}]m")
         print(f"距离: 均值={np.mean(dists):.3f}m  中值={np.median(dists):.3f}m")
-        print(f"平滑位置: ({sx:.3f}, {sy:.3f})m")
     else:
         xs = ys = dists = []
 
+    print(f"\n===== Theta 统计 ({n_valid_t}/{len(frames)} 帧有效) =====")
+    if n_valid_t > 0:
+        xs_t = [p[0] for p in valid_pos_t]
+        ys_t = [p[1] for p in valid_pos_t]
+        dists_t = [np.sqrt(x * x + y * y) for x, y in valid_pos_t]
+        print(f"X: 均值={np.mean(xs_t):.3f}m  中值={np.median(xs_t):.3f}m  范围=[{min(xs_t):.3f}, {max(xs_t):.3f}]m")
+        print(f"Y: 均值={np.mean(ys_t):.3f}m  中值={np.median(ys_t):.3f}m  范围=[{min(ys_t):.3f}, {max(ys_t):.3f}]m")
+        print(f"距离: 均值={np.mean(dists_t):.3f}m  中值={np.median(dists_t):.3f}m")
+    else:
+        xs_t = ys_t = dists_t = []
+
     # ====== 图表 ======
     fig, axes = plt.subplots(2, 3, figsize=(16, 10))
-    fig.suptitle(f"3-Mic TDOA 2D 定位  (MIC1(-10,0) MIC2(10,0) MIC3(0,10)cm, {len(frames)}帧)", fontsize=14)
+    fig.suptitle(f"3-Mic TDOA 2D 定位  (MIC1(0,0) MIC2({D*100:.0f},0) MIC3(0,-{D*100:.0f})cm, {len(frames)}帧)", fontsize=14)
 
     # 1. 声源位置散点图
     ax = axes[0, 0]
-    ax.set_title("声源位置 (俯视图)")
+    ax.set_title("声源位置 (俯视图)  Fang红/Theta蓝")
     ax.set_xlabel("X (m)")
     ax.set_ylabel("Y (m)")
-    ax.scatter([-D, D, 0], [0, 0, D],
+    ax.scatter([0, D, 0], [0, 0, -D],
                c=["#00cc66", "#ff6633", "#3399ff"], marker="^", s=150, zorder=5,
                label="MIC1(green) MIC2(orange) MIC3(blue)")
     if n_valid > 0:
-        ax.scatter(xs, ys, c=range(n_valid), cmap="viridis", s=20, alpha=0.7)
+        ax.scatter(xs, ys, c="#ff3333", marker="o", s=20, alpha=0.7, label="Fang")
+    if n_valid_t > 0:
+        ax.scatter(xs_t, ys_t, c="#3333ff", marker="x", s=20, alpha=0.7, label="Theta")
     ax.axhline(0, color="gray", lw=0.5)
     ax.axvline(0, color="gray", lw=0.5)
     ax.set_aspect("equal")
@@ -254,9 +322,11 @@ def main():
     ax.set_xlabel("帧序号")
     ax.set_ylabel("X (m)")
     if n_valid > 0:
-        ax.plot(range(n_valid), xs, lw=1)
-        ax.axhline(np.median(xs), color="r", lw=1, linestyle="--", label="中值")
-        ax.legend(fontsize=8)
+        ax.plot(range(n_valid), xs, lw=1, color="#ff3333", label="Fang")
+    if n_valid_t > 0:
+        ax.plot(range(n_valid_t), xs_t, lw=1, color="#3333ff", label="Theta")
+    ax.axhline(0, color="gray", lw=1, linestyle="--")
+    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
     # 3. Y 坐标时间序列
@@ -265,9 +335,11 @@ def main():
     ax.set_xlabel("帧序号")
     ax.set_ylabel("Y (m)")
     if n_valid > 0:
-        ax.plot(range(n_valid), ys, lw=1)
-        ax.axhline(np.median(ys), color="r", lw=1, linestyle="--", label="中值")
-        ax.legend(fontsize=8)
+        ax.plot(range(n_valid), ys, lw=1, color="#ff3333", label="Fang")
+    if n_valid_t > 0:
+        ax.plot(range(n_valid_t), ys_t, lw=1, color="#3333ff", label="Theta")
+    ax.axhline(0, color="gray", lw=1, linestyle="--")
+    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
     # 4. 角度 θ12 (X轴方向)

@@ -17,7 +17,7 @@ import os
 import queue
 
 # ============ 配置 ============
-PORT = "COM10"
+PORT = "COM12"
 BAUDRATE = 115200
 PLOT_WINDOW = 1024
 Y_RANGE = 500
